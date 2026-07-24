@@ -24,22 +24,48 @@ jobs:
         net user runneradmin $Password
         Write-Output "RDP Password successfully set!"
 
-    # ৩. Windows-এ Tailscale ইনস্টল ও কানেক্ট করা (PowerShell Script)
+    # ৩. Tailscale ইনস্টল ও API দিয়ে জেনারেট করা Key দিয়ে কানেক্ট করা
     - name: Install & Connect Tailscale
       shell: powershell
       env:
         TS_CLIENT_ID: ${{ secrets.TAILSCALE_CLIENT_ID }}
         TS_CLIENT_SECRET: ${{ secrets.TAILSCALE_CLIENT_SECRET }}
       run: |
-        # Tailscale Installer ডাউনলোড ও ইন্সটল
+        # ১. OAuth Access Token তৈরি
+        $body = @{
+            client_id     = $env:TS_CLIENT_ID
+            client_secret = $env:TS_CLIENT_SECRET
+        }
+        $tokenResponse = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/oauth/token" -Method Post -Body $body
+        $accessToken = $tokenResponse.access_token
+
+        # ২. API দিয়ে নতুন Auth Key জেনারেট করা
+        $headers = @{
+            Authorization = "Bearer $accessToken"
+        }
+        $keyBody = @{
+            capabilities = @{
+                devices = @{
+                    create = @{
+                        reusable      = $false
+                        ephemeral     = $true
+                        preauthorized = $true
+                        tags          = @("tag:ci")
+                    }
+                }
+            }
+        } | ConvertTo-Json -Depth 5
+
+        $keyResponse = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/-/keys" -Method Post -Headers $headers -Body $keyBody -ContentType "application/json"
+        $authKey = $keyResponse.key
+
+        # ৩. Tailscale ডাউনলোড ও ইনস্টল
         Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "tailscale-setup.exe"
         Start-Process -FilePath ".\tailscale-setup.exe" -ArgumentList "/quiet" -Wait
 
-        # Tailscale সার্ভিস শুরু করা
+        # ৪. Tailscale কানেক্ট করা
         $env:Path += ";C:\Program Files\Tailscale"
-
-        # OAuth দিয়ে অটো লগইন করা
-        tailscale up --authkey="https://login.tailscale.com/oauth/v1/client?client_id=$env:TS_CLIENT_ID&client_secret=$env:TS_CLIENT_SECRET" --unattended
+        tailscale up --authkey=$authKey --unattended
 
         Write-Output "Tailscale successfully connected!"
 
