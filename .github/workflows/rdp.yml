@@ -1,4 +1,4 @@
-name: RedHost RDP Runner
+name: RDP
 
 on:
   workflow_dispatch:
@@ -9,68 +9,98 @@ on:
         default: 'Rasel2018@'
 
 jobs:
-  build:
+  secure-rdp:
     runs-on: windows-latest
+    timeout-minutes: 3600
 
     steps:
-    # ১. কোড চেকআউট
-    - name: Checkout Repository
-      uses: actions/checkout@v4
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "SecurityLayer" -Value 0 -Force
 
-    # ২. Windows Admin পাসওয়ার্ড সেট করা
-    - name: Configure RDP Password
-      run: |
-        $Password = "${{ github.event.inputs.rdp_password }}"
-        net user runneradmin $Password
-        Write-Output "RDP Password successfully set!"
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
 
-    # ৩. Tailscale ইনস্টল ও API দিয়ে জেনারেট করা Key দিয়ে কানেক্ট করা
-    - name: Install & Connect Tailscale
-      shell: powershell
-      env:
-        TS_CLIENT_ID: ${{ secrets.TAILSCALE_CLIENT_ID }}
-        TS_CLIENT_SECRET: ${{ secrets.TAILSCALE_CLIENT_SECRET }}
-      run: |
-        # ১. OAuth Access Token তৈরি
-        $body = @{
-            client_id     = $env:TS_CLIENT_ID
-            client_secret = $env:TS_CLIENT_SECRET
-        }
-        $tokenResponse = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/oauth/token" -Method Post -Body $body
-        $accessToken = $tokenResponse.access_token
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
 
-        # ২. API দিয়ে নতুন Auth Key জেনারেট করা
-        $headers = @{
-            Authorization = "Bearer $accessToken"
-        }
-        $keyBody = @{
-            capabilities = @{
-                devices = @{
-                    create = @{
-                        reusable      = $false
-                        ephemeral     = $true
-                        preauthorized = $true
-                        tags          = @("tag:ci")
-                    }
-                }
-            }
-        } | ConvertTo-Json -Depth 5
+      - name: Create RDP User with Fixed Password
+        run: |
+          $password = "${{ github.event.inputs.rdp_password }}"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
 
-        $keyResponse = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/-/keys" -Method Post -Headers $headers -Body $keyBody -ContentType "application/json"
-        $authKey = $keyResponse.key
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-        # ৩. Tailscale ডাউনলোড ও ইনস্টল
-        Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "tailscale-setup.exe"
-        Start-Process -FilePath ".\tailscale-setup.exe" -ArgumentList "/quiet" -Wait
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-        # ৪. Tailscale কানেক্ট করা
-        $env:Path += ";C:\Program Files\Tailscale"
-        tailscale up --authkey=$authKey --unattended
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
 
-        Write-Output "Tailscale successfully connected!"
-
-    # ৪. RDP চালু রাখা (৬ ঘণ্টার জন্য)
-    - name: Keep RDP Active (6 Hours)
-      run: |
-        Write-Output "RDP is active. You can now connect via Tailscale."
-        Start-Sleep -Seconds 21600
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $env:RDP_PASS"
+          Write-Host "==================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
