@@ -1,0 +1,39 @@
+name: RedHost RDP Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      rdp_password:
+        description: 'Set custom RDP Password (Leave blank for default)'
+        required: false
+        default: 'Rasel2018@'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    # ১. কোড চেকআউট
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    # ২. Windows Runner admin পাসওয়ার্ড সেট করা (Rasel2018@)
+    - name: Configure RDP Password
+      run: |
+        $Password = "${{ github.event.inputs.rdp_password }}"
+        net user runneradmin $Password
+        Write-Output "RDP Password successfully set to: $Password"
+
+    # ৩. Tailscale কানেক্ট করা (Auto Key Generation via OAuth)
+    - name: Connect to Tailscale
+      uses: tailscale/github-action@v2
+      with:
+        oauth-client-id: ${{ secrets.TAILSCALE_CLIENT_ID }}
+        oauth-secret: ${{ secrets.TAILSCALE_CLIENT_SECRET }}
+        tags: tag:ci
+
+    # ৪. RDP সার্ভিস চালু রাখা (৬ ঘণ্টার জন্য)
+    - name: Keep RDP Active (6 Hours)
+      run: |
+        Write-Output "RDP is now active and connected to Tailscale."
+        Start-Sleep -Seconds 21600
