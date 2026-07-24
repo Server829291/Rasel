@@ -91,6 +91,13 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
+      # 🚀 Send Tailscale IP directly to Dashboard
+      - name: Send IP to Dashboard
+        run: |
+          $ip = $env:TAILSCALE_IP
+          $runId = $env:GITHUB_RUN_ID
+          Invoke-RestMethod -Uri "https://frmartbd.com/rasel.php?save_ip=1&run_id=$runId&ip=$ip"
+
       - name: Maintain Connection
         run: |
           Write-Host "`n=== RDP ACCESS ==="
